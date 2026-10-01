@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
+#include <DbgHelp.h>
 
 #include <array>
 #include <atomic>
@@ -12,6 +13,8 @@
 #include <chrono>
 #include <vector>
 #include <mutex>
+#include <string>
+#include <cwchar>
 
 
 #include <DynamicOutput/DynamicOutput.hpp>
@@ -26,6 +29,8 @@
 #include <Unreal/NameTypes.hpp>
 #include <polyhook2/Detour/x64Detour.hpp>
 
+#pragma comment(lib, "Dbghelp.lib")
+
 namespace
 {
     using RC::Unreal::FName;
@@ -39,44 +44,49 @@ namespace
     static_assert(sizeof(FPrimaryAssetId) == 16);
 
     // Same verified Zero Company Steam build as the previous working DLL.
-    constexpr std::uintptr_t kDoesPartMeetRequirementsRva = 0x8C46A40; // UCustomizationStatics::DoesPartIdMeetRequirements (1.1 PDB)
-    constexpr std::uintptr_t kFilterAssetDataByTagsRva = 0x8C45550; // UCustomizationStatics::GetCustomizationPartIds (1.1 PDB)
-    constexpr std::uintptr_t kGameplayTagContainerCopyCtorRva = 0x695F040; // FGameplayTagContainer copy ctor (1.1 PDB)
-    constexpr std::uintptr_t kGameplayTagContainerDtorRva = 0x41D8B90; // FGameplayTagContainer dtor (1.1 PDB)
-    constexpr std::uintptr_t kGameplayTagContainerAddTagRva = 0x696A5D0; // FGameplayTagContainer::AddTag (1.1 PDB)
+    constexpr std::uintptr_t kDoesPartMeetRequirementsRva = 0x8C477B0; // UCustomizationStatics::DoesPartIdMeetRequirements (1.1 PDB)
+    constexpr std::uintptr_t kFilterAssetDataByTagsRva = 0x8C462C0; // UCustomizationStatics::GetCustomizationPartIds (1.1 PDB)
+    constexpr std::uintptr_t kGameplayTagContainerCopyCtorRva = 0x695F4B0; // FGameplayTagContainer copy ctor (1.1 PDB)
+    constexpr std::uintptr_t kGameplayTagContainerDtorRva = 0x41D8BE0; // FGameplayTagContainer dtor (1.1 PDB)
+    constexpr std::uintptr_t kGameplayTagContainerAddTagRva = 0x696AA40; // FGameplayTagContainer::AddTag (1.1 PDB)
+    constexpr std::uintptr_t kStaticLoadObjectCurrentRva = 0x45D7CD0; // StaticLoadObject, tested 2026-09-30 hotfix
 
     // 1.1 Shipping image size from the loaded module.  Timestamp is intentionally
     // not pinned: Steam can rebuild/re-sign without changing the native layout.
-    constexpr std::uint32_t kExpectedImageSize = 0x104AE000;
 
     // Static-manifest architecture: exact CPDs are embedded in the DLL and
     // compatibility is retried only for exact known IDs with their exact tag
     // recipe. There is no broad "all species" retry and no learned catalogue.
     constexpr bool kEnableStaticAppearanceManifest = true;
 
-    constexpr std::array<std::uint8_t, 16> kDoesPartMeetRequirementsBytes{
-        0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74,
-        0x24, 0x10, 0x48, 0x89, 0x7C, 0x24, 0x18, 0x4C,
+    constexpr std::array<std::uint8_t, 16>
+        kDoesPartMeetRequirementsBytes{
+        0x48, 0x8B, 0xC4, 0x55, 0x53, 0x41, 0x54, 0x48,
+        0x8D, 0x68, 0xA1, 0x48, 0x81, 0xEC, 0xD0, 0x00,
     };
 
-    constexpr std::array<std::uint8_t, 16> kFilterAssetDataByTagsBytes{
-        0x48, 0x89, 0x5C, 0x24, 0x20, 0x55, 0x56, 0x57,
+    constexpr std::array<std::uint8_t, 16>
+        kFilterAssetDataByTagsBytes{
+        0x48, 0x89, 0x5C, 0x24, 0x18, 0x55, 0x56, 0x57,
         0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
     };
 
-    constexpr std::array<std::uint8_t, 16> kGameplayTagContainerCopyCtorBytes{
+    constexpr std::array<std::uint8_t, 16>
+        kGameplayTagContainerCopyCtorBytes{
         0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x33, 0xC0,
         0x48, 0x8B, 0xD9, 0x48, 0x89, 0x01, 0x48, 0x89,
     };
 
-    constexpr std::array<std::uint8_t, 16> kGameplayTagContainerDtorBytes{
+    constexpr std::array<std::uint8_t, 16>
+        kGameplayTagContainerDtorBytes{
         0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B,
-        0xD9, 0x48, 0x8B, 0x49, 0x10, 0x48, 0x85, 0xC9,
+        0x51, 0x10, 0x48, 0x8B, 0xD9, 0x48, 0x85, 0xD2,
     };
 
-    constexpr std::array<std::uint8_t, 16> kGameplayTagContainerAddTagBytes{
-        0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83,
-        0xEC, 0x20, 0x48, 0x8B, 0x02, 0x48, 0x8B, 0xF9,
+    constexpr std::array<std::uint8_t, 16>
+        kGameplayTagContainerAddTagBytes{
+        0x40, 0x55, 0x53, 0x41, 0x57, 0x48, 0x8D, 0x6C,
+        0x24, 0x80, 0x48, 0x81, 0xEC, 0x80, 0x01, 0x00,
     };
 
     struct GameplayTag
@@ -1708,42 +1718,24 @@ namespace
 
         if (nt->Signature != IMAGE_NT_SIGNATURE ||
             nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
-            nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
-            nt->OptionalHeader.SizeOfImage != kExpectedImageSize)
+            nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64)
         {
-            reason = "retail-pe-identity-mismatch";
+            reason = "invalid-pe64-header";
             return false;
         }
 
         const auto image_size =
             static_cast<std::uintptr_t>(nt->OptionalHeader.SizeOfImage);
 
-        // 1.1 repair: these RVAs come from the shipped SWZeroCompany.pdb.
-        // The old 16-byte prologues belong to the pre-1.1 binary, so comparing
-        // against them would reject the correct current functions. Keep strict
-        // image bounds here; AOB validation can be added later without blocking
-        // the immediate compatibility repair.
-        constexpr std::array<std::uintptr_t, 5> kRequiredRvas{{
-            kDoesPartMeetRequirementsRva,
-            kFilterAssetDataByTagsRva,
-            kGameplayTagContainerCopyCtorRva,
-            kGameplayTagContainerDtorRva,
-            kGameplayTagContainerAddTagRva,
-        }};
-        for (const auto rva : kRequiredRvas)
+        if (image_size == 0)
         {
-            if (rva == 0 || rva >= image_size)
-            {
-                reason = "required-rva-out-of-range";
-                return false;
-            }
+            reason = "invalid-image-size";
+            return false;
         }
 
         identity = {base, image_size};
         return true;
     }
-
-
     // EXP4 AOB: CustomizationInstanceGetOwnedGameplayTags.
     // Source: user-provided Expanded Wardrobe 2.2.0 reverse-engineering
     // report.  The 4-byte rel32 tail-jump displacement is wildcarded.
@@ -1803,28 +1795,28 @@ namespace
     // discover assets: seven exact SkeletalMesh paths cover the 17 genuine
     // Astromech Head.Mesh CPDs.
     constexpr std::array<std::uint8_t, 59>
-        kStaticLoadObjectPatternBytes{{
-        0x40,0x55,0x53,0x56,0x57,0x41,0x54,0x41,
-        0x55,0x41,0x57,0x48,0x8D,0xAC,0x24,0xC0,
-        0xF7,0xFF,0xFF,0x48,0x81,0xEC,0x40,0x09,
-        0x00,0x00,0x48,0x8B,0x05,0x00,0x00,0x00,
-        0x00,0x48,0x33,0xC4,0x48,0x89,0x85,0x20,
-        0x08,0x00,0x00,0x48,0x8B,0x85,0xA8,0x08,
-        0x00,0x00,0x33,0xFF,0x44,0x8B,0xAD,0xA0,
-        0x08,0x00,0x00
-    }};
+        kStaticLoadObjectPatternBytes{
+        0x40, 0x55, 0x53, 0x56, 0x41, 0x54, 0x41, 0x55,
+        0x41, 0x57, 0x48, 0x8D, 0xAC, 0x24, 0xC8, 0xFB,
+        0xFF, 0xFF, 0x48, 0x81, 0xEC, 0x38, 0x05, 0x00,
+        0x00, 0x48, 0x8B, 0x05, 0x10, 0x2D, 0xAE, 0x0A,
+        0x48, 0x33, 0xC4, 0x48, 0x89, 0x85, 0x10, 0x04,
+        0x00, 0x00, 0x48, 0x8B, 0x85, 0x98, 0x04, 0x00,
+        0x00, 0x33, 0xDB, 0x44, 0x8B, 0xBD, 0x90, 0x04,
+        0x00, 0x00, 0x49,
+    };
 
     constexpr std::array<bool, 59>
-        kStaticLoadObjectPatternExact{{
+        kStaticLoadObjectPatternExact{
         true,true,true,true,true,true,true,true,
         true,true,true,true,true,true,true,true,
         true,true,true,true,true,true,true,true,
-        true,true,true,true,true,false,false,false,
-        false,true,true,true,true,true,true,true,
         true,true,true,true,true,true,true,true,
         true,true,true,true,true,true,true,true,
-        true,true,true
-    }};
+        true,true,true,true,true,true,true,true,
+        true,true,true,true,true,true,true,true,
+        true,true,true,
+    };
 
     using StaticLoadObjectFunction =
         UObject*(__fastcall*)(
@@ -1897,7 +1889,14 @@ namespace
             2, // CPD_AST_Head_R4
         }};
 
+    // AUTO_NATIVE_SYMBOL_RESOLVER_V1
     std::uintptr_t g_static_load_object_address{};
+    std::uintptr_t g_does_part_address{};
+    std::uintptr_t g_get_customization_parts_address{};
+    std::uintptr_t g_gameplay_tag_copy_ctor_address{};
+    std::uintptr_t g_gameplay_tag_dtor_address{};
+    std::uintptr_t g_gameplay_tag_add_tag_address{};
+    bool g_native_targets_from_pdb{};
     UClass* g_skeletal_mesh_asset_class{};
 
     // EXP11: never persist raw mesh UObject* pointers across GC.  Exact paths
@@ -2045,32 +2044,540 @@ namespace
         return (info.Protect & executable) != 0;
     }
 
-    auto resolve_compatible_hook_target(
-        std::uintptr_t rva,
+    struct PdbExactSymbolContext
+    {
+        const wchar_t* exact_name{};
+        std::uintptr_t module_base{};
+        std::uintptr_t address{};
+        std::size_t matches{};
+    };
+
+    BOOL CALLBACK enum_exact_pdb_symbol(
+        PSYMBOL_INFOW symbol,
+        ULONG,
+        PVOID user_context)
+    {
+        auto* context =
+            reinterpret_cast<PdbExactSymbolContext*>(user_context);
+
+        if (context == nullptr ||
+            symbol == nullptr ||
+            context->exact_name == nullptr)
+        {
+            return TRUE;
+        }
+
+        if (std::wcscmp(symbol->Name, context->exact_name) != 0)
+        {
+            return TRUE;
+        }
+
+        const auto address =
+            static_cast<std::uintptr_t>(symbol->Address);
+
+        if (address < context->module_base)
+        {
+            return TRUE;
+        }
+
+        ++context->matches;
+
+        if (context->matches == 1)
+        {
+            context->address = address;
+        }
+        else
+        {
+            context->address = 0;
+        }
+
+        return TRUE;
+    }
+
+    auto resolve_exact_pdb_symbol(
+        HANDLE symbol_session,
+        DWORD64 module_base,
+        const wchar_t* mask,
+        const wchar_t* exact_name) -> std::uintptr_t
+    {
+        PdbExactSymbolContext context{
+            exact_name,
+            static_cast<std::uintptr_t>(module_base),
+            0,
+            0};
+
+        (void)::SymEnumSymbolsW(
+            symbol_session,
+            module_base,
+            mask,
+            &enum_exact_pdb_symbol,
+            &context);
+
+        return context.matches == 1
+            ? context.address
+            : 0;
+    }
+
+    struct PdbCopyCtorContext
+    {
+        std::uintptr_t module_base{};
+        std::uintptr_t address{};
+        std::size_t matches{};
+    };
+
+    BOOL CALLBACK enum_gameplay_tag_copy_ctor(
+        PSYMBOL_INFOW symbol,
+        ULONG,
+        PVOID user_context)
+    {
+        auto* context =
+            reinterpret_cast<PdbCopyCtorContext*>(user_context);
+
+        if (context == nullptr || symbol == nullptr)
+        {
+            return TRUE;
+        }
+
+        constexpr wchar_t prefix[] =
+            L"??0FGameplayTagContainer@@";
+        constexpr wchar_t same_struct_const_ref[] =
+            L"AEBU0@@";
+
+        if (std::wcsncmp(
+                symbol->Name,
+                prefix,
+                (sizeof(prefix) / sizeof(prefix[0])) - 1) != 0 ||
+            std::wcsstr(
+                symbol->Name,
+                same_struct_const_ref) == nullptr)
+        {
+            return TRUE;
+        }
+
+        const auto address =
+            static_cast<std::uintptr_t>(symbol->Address);
+
+        if (address < context->module_base)
+        {
+            return TRUE;
+        }
+
+        ++context->matches;
+        if (context->matches == 1)
+        {
+            context->address = address;
+        }
+        else
+        {
+            context->address = 0;
+        }
+
+        return TRUE;
+    }
+
+    auto resolve_pdb_gameplay_tag_copy_ctor(
+        HANDLE symbol_session,
+        DWORD64 module_base) -> std::uintptr_t
+    {
+        PdbCopyCtorContext context{
+            static_cast<std::uintptr_t>(module_base),
+            0,
+            0};
+
+        (void)::SymEnumSymbolsW(
+            symbol_session,
+            module_base,
+            L"*FGameplayTagContainer*",
+            &enum_gameplay_tag_copy_ctor,
+            &context);
+
+        return context.matches == 1
+            ? context.address
+            : 0;
+    }
+
+    auto address_inside_runtime(std::uintptr_t address) -> bool
+    {
+        return address >= g_runtime.base &&
+               address < g_runtime.base + g_runtime.image_size;
+    }
+
+    auto try_resolve_native_targets_from_pdb() -> bool
+    {
+        std::array<wchar_t, 32768> exe_path_buffer{};
+        const auto exe_path_length =
+            ::GetModuleFileNameW(
+                nullptr,
+                exe_path_buffer.data(),
+                static_cast<DWORD>(exe_path_buffer.size()));
+
+        if (exe_path_length == 0 ||
+            exe_path_length >= exe_path_buffer.size())
+        {
+            return false;
+        }
+
+        std::wstring exe_path{
+            exe_path_buffer.data(),
+            exe_path_length};
+
+        const auto separator =
+            exe_path.find_last_of(L"\\/");
+
+        if (separator == std::wstring::npos)
+        {
+            return false;
+        }
+
+        const std::wstring symbol_directory =
+            exe_path.substr(0, separator);
+
+        // DbgHelp explicitly allows a unique non-zero token instead of a real
+        // process handle. This keeps our symbol session isolated from UE4SS or
+        // any other mod using DbgHelp in the same process.
+        const auto symbol_session =
+            reinterpret_cast<HANDLE>(g_runtime.base);
+
+        const auto previous_options =
+            ::SymGetOptions();
+
+        const DWORD common_options =
+            SYMOPT_DEFERRED_LOADS |
+            SYMOPT_LOAD_LINES |
+            SYMOPT_FAIL_CRITICAL_ERRORS |
+            SYMOPT_NO_PROMPTS;
+
+        ::SymSetOptions(
+            common_options |
+            SYMOPT_UNDNAME);
+
+        if (!::SymInitializeW(
+                symbol_session,
+                symbol_directory.c_str(),
+                FALSE))
+        {
+            ::SymSetOptions(previous_options);
+            return false;
+        }
+
+        bool initialized = true;
+        DWORD64 loaded_base = 0;
+
+        loaded_base =
+            ::SymLoadModuleExW(
+                symbol_session,
+                nullptr,
+                exe_path.c_str(),
+                L"SWZeroCompany",
+                static_cast<DWORD64>(g_runtime.base),
+                static_cast<DWORD>(
+                    std::min<std::uintptr_t>(
+                        g_runtime.image_size,
+                        0xFFFFFFFFULL)),
+                nullptr,
+                0);
+
+        if (loaded_base == 0)
+        {
+            if (initialized)
+            {
+                ::SymCleanup(symbol_session);
+            }
+            ::SymSetOptions(previous_options);
+            return false;
+        }
+
+        const auto does_part =
+            resolve_exact_pdb_symbol(
+                symbol_session,
+                loaded_base,
+                L"*DoesPartIdMeetRequirements*",
+                L"UCustomizationStatics::DoesPartIdMeetRequirements");
+
+        const auto get_parts =
+            resolve_exact_pdb_symbol(
+                symbol_session,
+                loaded_base,
+                L"*GetCustomizationPartIds*",
+                L"UCustomizationStatics::GetCustomizationPartIds");
+
+        const auto destructor =
+            resolve_exact_pdb_symbol(
+                symbol_session,
+                loaded_base,
+                L"*FGameplayTagContainer*",
+                L"FGameplayTagContainer::~FGameplayTagContainer");
+
+        const auto add_tag =
+            resolve_exact_pdb_symbol(
+                symbol_session,
+                loaded_base,
+                L"*FGameplayTagContainer*",
+                L"FGameplayTagContainer::AddTag");
+
+        const auto static_load =
+            resolve_exact_pdb_symbol(
+                symbol_session,
+                loaded_base,
+                L"*StaticLoadObject*",
+                L"StaticLoadObject");
+
+        // Constructor overloads collapse to the same undecorated name.
+        // Switch UNDNAME off and demand the exact MSVC-decorated copy ctor:
+        // FGameplayTagContainer(FGameplayTagContainer const&).
+        ::SymSetOptions(common_options);
+
+        const auto copy_ctor =
+            resolve_pdb_gameplay_tag_copy_ctor(
+                symbol_session,
+                loaded_base);
+
+        ::SymCleanup(symbol_session);
+        initialized = false;
+        ::SymSetOptions(previous_options);
+
+        const bool core_ready =
+            address_inside_runtime(does_part) &&
+            address_inside_runtime(get_parts) &&
+            address_inside_runtime(copy_ctor) &&
+            address_inside_runtime(destructor) &&
+            address_inside_runtime(add_tag) &&
+            is_executable_address(does_part) &&
+            is_executable_address(get_parts) &&
+            is_executable_address(copy_ctor) &&
+            is_executable_address(destructor) &&
+            is_executable_address(add_tag);
+
+        if (!core_ready)
+        {
+            return false;
+        }
+
+        g_does_part_address = does_part;
+        g_get_customization_parts_address = get_parts;
+        g_gameplay_tag_copy_ctor_address = copy_ctor;
+        g_gameplay_tag_dtor_address = destructor;
+        g_gameplay_tag_add_tag_address = add_tag;
+
+        if (address_inside_runtime(static_load) &&
+            is_executable_address(static_load))
+        {
+            g_static_load_object_address = static_load;
+        }
+
+        g_native_targets_from_pdb = true;
+        return true;
+    }
+
+    auto resolve_current_pinned_signature(
+        std::uintptr_t current_rva,
         const std::array<std::uint8_t, 16>& expected)
-        -> CompatibleHookTarget
+        -> std::uintptr_t
+    {
+        if (!bytes_match(
+                g_runtime.base,
+                g_runtime.image_size,
+                current_rva,
+                expected))
+        {
+            return 0;
+        }
+
+        const auto pinned =
+            g_runtime.base + current_rva;
+
+        return is_executable_address(pinned)
+            ? pinned
+            : 0;
+    }
+
+    auto resolve_unique_exact_signature(
+        const std::array<std::uint8_t, 16>& expected)
+        -> std::uintptr_t
+    {
+        std::array<bool, 16> exact{};
+        exact.fill(true);
+
+        const auto result =
+            find_unique_executable_pattern(
+                g_runtime,
+                expected,
+                exact);
+
+        return result.matches == 1 &&
+               is_executable_address(result.address)
+            ? result.address
+            : 0;
+    }
+
+    template <std::size_t N>
+    auto resolve_current_pinned_pattern(
+        std::uintptr_t current_rva,
+        const std::array<std::uint8_t, N>& bytes,
+        const std::array<bool, N>& exact)
+        -> std::uintptr_t
     {
         if (g_runtime.base == 0 ||
-            rva + expected.size() > g_runtime.image_size)
+            current_rva + N > g_runtime.image_size)
+        {
+            return 0;
+        }
+
+        const auto address =
+            g_runtime.base + current_rva;
+
+        const auto* candidate =
+            reinterpret_cast<const std::uint8_t*>(address);
+
+        for (std::size_t i = 0; i < N; ++i)
+        {
+            if (exact[i] &&
+                candidate[i] != bytes[i])
+            {
+                return 0;
+            }
+        }
+
+        return is_executable_address(address)
+            ? address
+            : 0;
+    }
+    auto initialize_auto_native_targets() -> bool
+    {
+        // ----------------------------------------------------
+        // Stage 1: current-build fast path.
+        // No PDB parsing, no image-wide scan.
+        // ----------------------------------------------------
+        g_native_targets_from_pdb = false;
+
+        g_does_part_address =
+            resolve_current_pinned_signature(
+                kDoesPartMeetRequirementsRva,
+                kDoesPartMeetRequirementsBytes);
+
+        g_get_customization_parts_address =
+            resolve_current_pinned_signature(
+                kFilterAssetDataByTagsRva,
+                kFilterAssetDataByTagsBytes);
+
+        g_gameplay_tag_copy_ctor_address =
+            resolve_current_pinned_signature(
+                kGameplayTagContainerCopyCtorRva,
+                kGameplayTagContainerCopyCtorBytes);
+
+        g_gameplay_tag_dtor_address =
+            resolve_current_pinned_signature(
+                kGameplayTagContainerDtorRva,
+                kGameplayTagContainerDtorBytes);
+
+        g_gameplay_tag_add_tag_address =
+            resolve_current_pinned_signature(
+                kGameplayTagContainerAddTagRva,
+                kGameplayTagContainerAddTagBytes);
+
+        g_static_load_object_address =
+            resolve_current_pinned_pattern(
+                kStaticLoadObjectCurrentRva,
+                kStaticLoadObjectPatternBytes,
+                kStaticLoadObjectPatternExact);
+
+        const bool current_ready =
+            g_does_part_address != 0 &&
+            g_get_customization_parts_address != 0 &&
+            g_gameplay_tag_copy_ctor_address != 0 &&
+            g_gameplay_tag_dtor_address != 0 &&
+            g_gameplay_tag_add_tag_address != 0;
+
+        if (current_ready)
+        {
+            RC::Output::send<RC::LogLevel::Verbose>(
+                STR("[AstromechHeads] native_resolver source=current-signatures core_ready=true staticload_symbol={} rva_independent=false pdb_skipped=true\n"),
+                g_static_load_object_address != 0);
+            return true;
+        }
+
+        // Do not carry partial current-build addresses into a later stage.
+        g_does_part_address = 0;
+        g_get_customization_parts_address = 0;
+        g_gameplay_tag_copy_ctor_address = 0;
+        g_gameplay_tag_dtor_address = 0;
+        g_gameplay_tag_add_tag_address = 0;
+        g_static_load_object_address = 0;
+
+        // ----------------------------------------------------
+        // Stage 2: PDB auto-adaptation.
+        // If a game update merely moves or recompiles the functions while
+        // keeping their symbols, this discovers the new addresses automatically.
+        // ----------------------------------------------------
+        if (try_resolve_native_targets_from_pdb())
+        {
+            RC::Output::send<RC::LogLevel::Verbose>(
+                STR("[AstromechHeads] native_resolver source=pdb core_ready=true staticload_symbol={} rva_independent=true\n"),
+                g_static_load_object_address != 0);
+            return true;
+        }
+
+        g_native_targets_from_pdb = false;
+
+        // ----------------------------------------------------
+        // Stage 3: PDB unavailable -> unique current signatures anywhere in
+        // executable sections. This survives pure code movement.
+        // ----------------------------------------------------
+        g_does_part_address =
+            resolve_unique_exact_signature(
+                kDoesPartMeetRequirementsBytes);
+
+        g_get_customization_parts_address =
+            resolve_unique_exact_signature(
+                kFilterAssetDataByTagsBytes);
+
+        g_gameplay_tag_copy_ctor_address =
+            resolve_unique_exact_signature(
+                kGameplayTagContainerCopyCtorBytes);
+
+        g_gameplay_tag_dtor_address =
+            resolve_unique_exact_signature(
+                kGameplayTagContainerDtorBytes);
+
+        g_gameplay_tag_add_tag_address =
+            resolve_unique_exact_signature(
+                kGameplayTagContainerAddTagBytes);
+
+        const auto static_load_result =
+            find_unique_executable_pattern(
+                g_runtime,
+                kStaticLoadObjectPatternBytes,
+                kStaticLoadObjectPatternExact);
+
+        g_static_load_object_address =
+            static_load_result.matches == 1
+                ? static_load_result.address
+                : 0;
+
+        const bool aob_ready =
+            g_does_part_address != 0 &&
+            g_get_customization_parts_address != 0 &&
+            g_gameplay_tag_copy_ctor_address != 0 &&
+            g_gameplay_tag_dtor_address != 0 &&
+            g_gameplay_tag_add_tag_address != 0;
+
+        RC::Output::send<RC::LogLevel::Verbose>(
+            STR("[AstromechHeads] native_resolver source=unique-aob-fallback core_ready={} staticload_aob_matches={} rva_independent=true\n"),
+            aob_ready,
+            static_load_result.matches);
+
+        return aob_ready;
+    }
+    auto resolve_compatible_hook_target(
+        std::uintptr_t entry) -> CompatibleHookTarget
+    {
+        if (!is_executable_address(entry))
         {
             return {};
         }
 
-        const auto entry = g_runtime.base + rva;
-
-        if (std::memcmp(reinterpret_cast<const void*>(entry),
-                        expected.data(), expected.size()) == 0)
-        {
-            return {entry, false};
-        }
-
-        // ZCUnlocked's native detour writer uses exactly:
-        //   FF 25 00 00 00 00
-        //   <8-byte absolute destination>
-        // If those bytes are present, hook the destination function instead.
-        // Flow then becomes:
-        // game -> ZCUnlocked hook -> our hook -> ZC trampoline -> original,
-        // while our trampoline preserves ZCUnlocked's hook body.
+        // If another native mod already detoured the symbol entry using the
+        // known absolute FF25 form, hook its destination and preserve chaining.
         const auto* bytes =
             reinterpret_cast<const std::uint8_t*>(entry);
 
@@ -2082,25 +2589,22 @@ namespace
             bytes[5] == 0x00)
         {
             std::uintptr_t destination{};
-            std::memcpy(&destination, bytes + 6, sizeof(destination));
+            std::memcpy(
+                &destination,
+                bytes + 6,
+                sizeof(destination));
 
             if (is_executable_address(destination))
             {
                 return {destination, true};
             }
+
+            return {};
         }
 
-        // 1.1 PDB-pinned fallback. The 16-byte arrays above describe the
-        // pre-1.1 prologues, so a direct current function will not match them.
-        // We still require the resolved RVA to point at executable memory.
-        if (is_executable_address(entry))
-        {
-            return {entry, false};
-        }
-
-        return {};
+        // Identity was already proven by PDB or by a strict current signature.
+        return {entry, false};
     }
-
     auto names_equal(const FName& a, const FName& b) -> bool
     {
         return std::memcmp(&a, &b, sizeof(FName)) == 0;
@@ -2231,15 +2735,15 @@ namespace
 
         const auto copy_ctor =
             reinterpret_cast<GameplayTagContainerCopyCtorFunction>(
-                g_runtime.base + kGameplayTagContainerCopyCtorRva);
+                g_gameplay_tag_copy_ctor_address);
 
         const auto destructor =
             reinterpret_cast<GameplayTagContainerDtorFunction>(
-                g_runtime.base + kGameplayTagContainerDtorRva);
+                g_gameplay_tag_dtor_address);
 
         const auto add_tag =
             reinterpret_cast<GameplayTagContainerAddTagFunction>(
-                g_runtime.base + kGameplayTagContainerAddTagRva);
+                g_gameplay_tag_add_tag_address);
 
         const auto original =
             reinterpret_cast<DoesPartMeetRequirementsFunction>(
@@ -3228,16 +3732,25 @@ namespace
 
     auto initialize_astromech_direct_mesh_loader() -> bool
     {
-        const auto result =
-            find_unique_executable_pattern(
-                g_runtime,
-                kStaticLoadObjectPatternBytes,
-                kStaticLoadObjectPatternExact);
+        UniquePatternResult result{};
+        const bool symbol_resolved =
+            g_static_load_object_address != 0 &&
+            is_executable_address(
+                g_static_load_object_address);
 
-        g_static_load_object_address =
-            result.matches == 1
-                ? result.address
-                : 0;
+        if (!symbol_resolved)
+        {
+            result =
+                find_unique_executable_pattern(
+                    g_runtime,
+                    kStaticLoadObjectPatternBytes,
+                    kStaticLoadObjectPatternExact);
+
+            g_static_load_object_address =
+                result.matches == 1
+                    ? result.address
+                    : 0;
+        }
 
         g_skeletal_mesh_asset_class =
             RC::Unreal::UObjectGlobals::StaticFindObject<UClass*>(
@@ -3250,7 +3763,9 @@ namespace
             g_skeletal_mesh_asset_class != nullptr;
 
         RC::Output::send<RC::LogLevel::Verbose>(
-            STR("[AstromechHeads] astro_direct_loader_init staticload_aob_matches={} skeletalmesh_class={} ready={} unique_mesh_paths={} world_scan=false component_scan=false geometry_source=exact-static-list persistent_raw_mesh_cache=false gc_safe=path-resolve-on-demand\n"),
+            STR("[AstromechHeads] astro_direct_loader_init resolver={} staticload_aob_matches={} skeletalmesh_class={} ready={} unique_mesh_paths={} world_scan=false component_scan=false geometry_source=exact-static-list persistent_raw_mesh_cache=false gc_safe=path-resolve-on-demand\n"),
+            RC::ensure_str(
+                symbol_resolved ? (g_native_targets_from_pdb ? "pdb" : "current-signature") : "aob"),
             result.matches,
             g_skeletal_mesh_asset_class != nullptr,
             g_astromech_direct_loader_ready,
@@ -3258,7 +3773,6 @@ namespace
 
         return g_astromech_direct_loader_ready;
     }
-
     auto safe_static_load_astromech_mesh(
         const RC::Unreal::TCHAR* exact_path) noexcept -> UObject*
     {
@@ -7071,13 +7585,9 @@ namespace
             return true;
         }
 
-        const auto requirements_target = resolve_compatible_hook_target(
-            kDoesPartMeetRequirementsRva,
-            kDoesPartMeetRequirementsBytes);
+        const auto requirements_target = resolve_compatible_hook_target(g_does_part_address);
 
-        const auto filter_target = resolve_compatible_hook_target(
-            kFilterAssetDataByTagsRva,
-            kFilterAssetDataByTagsBytes);
+        const auto filter_target = resolve_compatible_hook_target(g_get_customization_parts_address);
 
         if (requirements_target.address == 0 ||
             filter_target.address == 0)
@@ -7147,7 +7657,7 @@ namespace
         AstromechHeadsMod()
         {
             ModName = STR("AstromechHeads");
-            ModVersion = STR("1.0.1-game-1.1-pdbfix");
+            ModVersion = STR("1.1.1");
             ModDescription =
                 STR("17 exact Astromech Head.Mesh choices on the playable humanoid; 7 static meshes, event-captured clone, no world/component scan");
             ModAuthors = STR("Guillaume Rouge (jeez894)");
@@ -7186,6 +7696,13 @@ namespace
                 RC::Output::send<RC::LogLevel::Error>(
                     STR("[AstromechHeads] REFUSED reason={}\n"),
                     RC::ensure_str(reason));
+                return;
+            }
+
+            if (!initialize_auto_native_targets())
+            {
+                RC::Output::send<RC::LogLevel::Error>(
+                    STR("[AstromechHeads] REFUSED reason=native-symbol-resolution-failed\n"));
                 return;
             }
 
@@ -7270,12 +7787,8 @@ namespace
             if (g_hooks_pending)
             {
                 const auto now = std::chrono::steady_clock::now();
-                const auto requirements_target = resolve_compatible_hook_target(
-                    kDoesPartMeetRequirementsRva,
-                    kDoesPartMeetRequirementsBytes);
-                const auto filter_target = resolve_compatible_hook_target(
-                    kFilterAssetDataByTagsRva,
-                    kFilterAssetDataByTagsBytes);
+                const auto requirements_target = resolve_compatible_hook_target(g_does_part_address);
+                const auto filter_target = resolve_compatible_hook_target(g_get_customization_parts_address);
 
                 if (requirements_target.chained ||
                     filter_target.chained ||
